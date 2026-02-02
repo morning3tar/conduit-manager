@@ -1269,7 +1269,7 @@ show_dashboard() {
             echo -e "\033[K"
         fi
 
-        echo -e "${BOLD}Refreshes every 5 seconds. Press any key to return to menu...${NC}\033[K"
+        echo -e "${BOLD}Refreshes every 8 seconds. Press any key to return to menu...${NC}\033[K"
         
         # Clear any leftover lines below the dashboard content (Erase to End of Display)
         # This only cleans up if the dashboard gets shorter
@@ -1277,9 +1277,9 @@ show_dashboard() {
             printf "\033[J"
         fi
         
-        # Wait 4 seconds for keypress (compensating for processing time)
+        # Wait 7 seconds for keypress (reduced CPU: less frequent docker calls under load)
         # Redirect from /dev/tty ensures it works when the script is piped
-        if read -t 4 -n 1 -s < /dev/tty 2>/dev/null; then
+        if read -t 7 -n 1 -s < /dev/tty 2>/dev/null; then
             stop_dashboard=1
         fi
     done
@@ -1594,30 +1594,30 @@ AWK_BIN=$(command -v gawk 2>/dev/null || command -v awk 2>/dev/null || echo "awk
 LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
 [ -z "$LOCAL_IP" ] && LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
-# Batch process: resolve GeoIP + merge into cumulative files in bulk
+# Max new GeoIP lookups per batch (limits CPU under high peer count)
+GEOIP_MAX_NEW_PER_BATCH=80
+
+# Batch process: resolve GeoIP + merge into cumulative files in bulk (CPU-optimized)
 process_batch() {
     local batch="$1"
-    local resolved="$PERSIST_DIR/resolved_batch"
     local geo_map="$PERSIST_DIR/geo_map"
 
-    # Step 1: Extract unique IPs and bulk-resolve GeoIP
-    # Read cache once, resolve uncached, produce ip|country mapping
-    $AWK_BIN -F'|' '{print $2}' "$batch" | sort -u > "$PERSIST_DIR/batch_ips"
+    # Step 1: IPs ordered by total bytes (resolve high-traffic IPs first), single cache lookup
+    $AWK_BIN -F'|' '{ip=$2; b=$3+0; bytes[ip]+=b} END{for(i in bytes) print bytes[i], i}' "$batch" | sort -rn 2>/dev/null | $AWK_BIN '{print $2}' > "$PERSIST_DIR/batch_ips_ordered"
+    [ ! -s "$PERSIST_DIR/batch_ips_ordered" ] && return
 
-    # Build geo mapping: read cache + resolve missing
-    > "$geo_map"
+    # Single-pass: load cache once, output ip|country or ip|UNCACHED (no grep per IP)
+    touch "$GEOIP_CACHE" 2>/dev/null
+    $AWK_BIN -F'|' 'NR==FNR{c[$1]=$2; next} {if($1 in c) print $1"|"c[$1]; else print $1"|UNCACHED"}' "$GEOIP_CACHE" "$PERSIST_DIR/batch_ips_ordered" > "$geo_map"
+
+    # Resolve up to GEOIP_MAX_NEW_PER_BATCH uncached IPs (rest stay Unknown to limit CPU)
+    > "$PERSIST_DIR/new_resolutions"
+    local count=0
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
-        country=""
-        if [ -f "$GEOIP_CACHE" ]; then
-            country=$(grep "^${ip}|" "$GEOIP_CACHE" 2>/dev/null | head -1 | cut -d'|' -f2)
-        fi
-        if [ -z "$country" ]; then
-            country=$(geo_lookup "$ip")
-        fi
-        # Strip country code prefix (e.g. "US, United States" -> "United States")
+        [ "$count" -ge "$GEOIP_MAX_NEW_PER_BATCH" ] && break
+        country=$(geo_lookup "$ip")
         country=$(echo "$country" | sed 's/^[A-Z][A-Z], //')
-        # Normalize
         case "$country" in
             *Iran*) country="Iran - #FreeIran" ;;
             *Moldova*) country="Moldova" ;;
@@ -1629,9 +1629,19 @@ process_batch() {
             *"Tanzania"*) country="Tanzania" ;;
             *"Viet Nam"*|*Vietnam*) country="Vietnam" ;;
             *"Syrian Arab Republic"*) country="Syria" ;;
+            *) ;;
         esac
-        echo "${ip}|${country}" >> "$geo_map"
-    done < "$PERSIST_DIR/batch_ips"
+        echo "${ip}|${country}" >> "$PERSIST_DIR/new_resolutions"
+        count=$((count + 1))
+    done <<< "$($AWK_BIN -F'|' '$2=="UNCACHED"{print $1}' "$geo_map" | head -n "$GEOIP_MAX_NEW_PER_BATCH")"
+
+    # Merge: replace UNCACHED with resolved or Unknown (single pass)
+    if [ -s "$PERSIST_DIR/new_resolutions" ]; then
+        $AWK_BIN -F'|' 'NR==FNR{r[$1]=$2; next} $2=="UNCACHED"{if($1 in r) print $1"|"r[$1]; else print $1"|Unknown"; next} {print}' "$PERSIST_DIR/new_resolutions" "$geo_map" > "$geo_map.tmp" && mv "$geo_map.tmp" "$geo_map"
+    else
+        $AWK_BIN -F'|' '$2=="UNCACHED"{print $1"|Unknown"; next} {print}' "$geo_map" > "$geo_map.tmp" 2>/dev/null && mv "$geo_map.tmp" "$geo_map"
+    fi
+    rm -f "$PERSIST_DIR/new_resolutions" "$PERSIST_DIR/batch_ips_ordered"
 
     # Step 2: Single awk pass — merge batch into cumulative_data + write snapshot
     $AWK_BIN -F'|' -v snap="${SNAPSHOT_TMP:-$SNAPSHOT_FILE}" '
@@ -1684,7 +1694,7 @@ process_batch() {
         }
     ' "$geo_map" "$IPS_FILE" "$batch" > "$IPS_FILE.tmp" && mv "$IPS_FILE.tmp" "$IPS_FILE"
 
-    rm -f "$PERSIST_DIR/batch_ips" "$geo_map" "$resolved"
+    rm -f "$geo_map"
 }
 
 # Auto-restart stuck containers (no peers for 2+ hours)
@@ -1978,7 +1988,7 @@ show_advanced_stats() {
                 local cname=$(get_container_name $ci)
                 if echo "$docker_ps_cache" | grep -q "^${cname}$"; then
                     adv_running_names+=" $cname"
-                    ( docker logs --tail 30 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_adv_tmpdir/logs_${ci}" ) &
+                    ( docker logs --tail 20 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_adv_tmpdir/logs_${ci}" ) &
                 fi
             done
             local adv_all_stats=""
@@ -2250,7 +2260,7 @@ show_peers() {
             for ci in $(seq 1 $CONTAINER_COUNT); do
                 local cname=$(get_container_name $ci)
                 if echo "$docker_ps_cache" | grep -q "^${cname}$"; then
-                    ( docker logs --tail 30 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_peer_tmpdir/logs_${ci}" ) &
+                    ( docker logs --tail 20 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_peer_tmpdir/logs_${ci}" ) &
                 fi
             done
             wait
@@ -2431,7 +2441,7 @@ show_status() {
         if echo "$docker_ps_cache" | grep -q "[[:space:]]${cname}$"; then
             _c_running[$i]=true
             running_count=$((running_count + 1))
-            ( docker logs --tail 30 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_st_tmpdir/logs_${i}" ) &
+            ( docker logs --tail 20 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_st_tmpdir/logs_${i}" ) &
         fi
     done
     wait
@@ -3405,7 +3415,7 @@ manage_containers() {
             if echo "$docker_ps_cache" | grep -q "^${cname}$"; then
                 running_names+=" $cname"
                 # Fetch logs in parallel background jobs
-                ( docker logs --tail 30 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_mc_tmpdir/logs_${ci}" ) &
+                ( docker logs --tail 20 "$cname" 2>&1 | grep "\[STATS\]" | tail -1 > "$_mc_tmpdir/logs_${ci}" ) &
             fi
         done
         # Fetch stats in parallel with logs
@@ -3484,11 +3494,11 @@ manage_containers() {
         echo -e "  ${CYAN}────────────────────────────────────────${NC}"
         echo -ne "\033[?25h"
         local _mc_start=$(date +%s)
-        read -t 5 -p "  Enter choice: " mc_choice < /dev/tty 2>/dev/null || { mc_choice=""; }
+        read -t 8 -p "  Enter choice: " mc_choice < /dev/tty 2>/dev/null || { mc_choice=""; }
         echo -ne "\033[?25l"
         local _mc_elapsed=$(( $(date +%s) - _mc_start ))
 
-        # If read failed instantly (not a 5s timeout), /dev/tty is broken
+        # If read failed instantly (not an 8s timeout), /dev/tty is broken
         if [ -z "$mc_choice" ] && [ "$_mc_elapsed" -lt 2 ]; then
             _mc_tty_fails=$(( ${_mc_tty_fails:-0} + 1 ))
             [ "$_mc_tty_fails" -ge 3 ] && { echo -e "\n  ${RED}Input error. Cannot read from terminal.${NC}"; return; }
@@ -4206,7 +4216,7 @@ telegram_build_report() {
     local total_connecting=0
     for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
         local cname=$(get_container_name $i)
-        local last_stat=$(docker logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        local last_stat=$(docker logs --tail 100 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
         local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
         local cing=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connecting:") print $(j+1)+0}}' | head -1)
         total_peers=$((total_peers + ${peers:-0}))
@@ -4486,7 +4496,7 @@ No Conduit containers are running\\!"
     local total_peers=0
     for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
         local cname=$(get_container_name $i)
-        local last_stat=$(timeout 5 docker logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        local last_stat=$(timeout 5 docker logs --tail 100 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
         local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
         total_peers=$((total_peers + ${peers:-0}))
     done
@@ -4510,7 +4520,7 @@ record_snapshot() {
     local total_peers=0
     for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
         local cname=$(get_container_name $i)
-        local last_stat=$(docker logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        local last_stat=$(docker logs --tail 100 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
         local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
         total_peers=$((total_peers + ${peers:-0}))
     done
@@ -4653,7 +4663,7 @@ except Exception:
                 local total_cing=0
                 for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
                     local cname=$(get_container_name $i)
-                    local last_stat=$(timeout 5 docker logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+                    local last_stat=$(timeout 5 docker logs --tail 100 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
                     local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
                     local cing=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connecting:") print $(j+1)+0}}' | head -1)
                     total_peers=$((total_peers + ${peers:-0}))
@@ -4697,7 +4707,7 @@ except Exception:
                     if echo "$docker_names" | grep -q "^${cname}$"; then
                         ct_msg+="C${i} (${cname}): 🟢 Running"
                         ct_msg+=$'\n'
-                        local logs=$(timeout 5 docker logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+                        local logs=$(timeout 5 docker logs --tail 100 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
                         if [ -n "$logs" ]; then
                             local c_cing c_conn c_up c_down
                             IFS='|' read -r c_cing c_conn c_up c_down <<< $(echo "$logs" | awk '{
@@ -4819,7 +4829,7 @@ build_report() {
     local total_connecting=0
     for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
         local cname=$(get_container_name $i)
-        local last_stat=$(docker logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        local last_stat=$(docker logs --tail 100 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
         local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
         local cing=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connecting:") print $(j+1)+0}}' | head -1)
         total_peers=$((total_peers + ${peers:-0}))
@@ -6752,5 +6762,3 @@ SVCEOF
 # REACHED END OF SCRIPT - VERSION 1.2
 # ###############################################################################
 main "$@"
-
-
